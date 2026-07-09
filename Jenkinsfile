@@ -1,35 +1,42 @@
-
 pipeline {
-    agent any
+    agent { docker { image 'python:3.9-slim' } }
     
-    triggers {
-        githubPush()
+    environment {
+        AWS_REGION = 'us-east-1'
+        ECR_REPO = '123456789012.dkr.ecr.us-east-1.amazonaws.com/my-calculator'
+        IMAGE_TAG = "pr-${env.CHANGE_ID ?: 'main'}-${env.BUILD_NUMBER}"
     }
     
     stages {
         stage('Checkout') {
+            steps { checkout scm }
+        }
+        
+        stage('Build') {
             steps {
-                
-                checkout scm
+                sh "docker build -t ${ECR_REPO}:${IMAGE_TAG} ."
             }
         }
         
-        stage('Build Docker Image') {
+        stage('Test') {
             steps {
-                script {
-                    
-                    sh 'docker build -t my-calculator-app .'
-                }
+                sh 'pip install pytest'
+                sh 'pytest --junitxml=results.xml'
+            }
+            post {
+                always { junit 'results.xml' }
             }
         }
         
         stage('Push to ECR') {
             steps {
                 script {
-                    
-                    docker.withRegistry('https://<YOUR_AWS_ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com', 'aws-ecr-creds') {
-                        sh 'docker tag my-calculator-app:latest <YOUR_REPO_URI>:latest'
-                        sh 'docker push <YOUR_REPO_URI>:latest'
+                    withCredentials([[
+                        $class: 'AmazonWebServicesCredentialsBinding', 
+                        credentialsId: '992382545251'
+                    ]]) {
+                        sh "aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ECR_REPO}"
+                        sh "docker push ${ECR_REPO}:${IMAGE_TAG}"
                     }
                 }
             }
