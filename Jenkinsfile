@@ -47,15 +47,42 @@ pipeline {
             when { branch 'main' }
             steps {
                 script {
-                    sshagent(['prod-ssh-key']) { 
+                    sshagent(['prod-ssh-key']) {
                         sh """
                             ssh -o StrictHostKeyChecking=no ${PROD_SERVER} "
                                 aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ECR_REPO}
                                 docker pull ${ECR_REPO}:${IMAGE_TAG}
+                                
                                 docker stop my-calculator-app || true
                                 docker rm my-calculator-app || true
+                                
                                 docker run -d --name my-calculator-app -p 80:80 ${ECR_REPO}:${IMAGE_TAG}
                             "
+                        """
+                    }
+                }
+            }
+        }
+        
+        stage('Health Verification') {
+            when { branch 'main' }
+            steps {
+                script {
+                    
+                    sh """
+                        for i in {1..5}; do
+                            sleep 5
+                            if curl -f http://44.195.88.151/health; then
+                                echo 'Health check passed!'
+                                exit 0
+                            fi
+                            echo 'Health check failed, retrying...'
+                        done
+                        exit 1
+                    """
+                }
+            }
+        
                         """
                     }
                 }
