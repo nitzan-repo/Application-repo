@@ -1,57 +1,131 @@
 pipeline {
-    agent { docker { image 'docker:27-cli'; args '-u 0:0 -v /var/run/docker.sock:/var/run/docker.sock' } }
+    agent any
 
     environment {
-        // הגדרות קבועות
-        APP_USER = 'ec2-user'
-        DEPLOY_DIR = '/opt/calculator-app'
-        IMAGE_NAME = "calculator-app:${env.BRANCH_NAME}-${env.BUILD_NUMBER}"
-        // חישוב דינמי פשוט
-        IS_MASTER = "${env.BRANCH_NAME == 'master'}"
+        AWS_REGION = 'us-east-1'
+        ECR_REPO   = 'ecr-repo-nitzan'
+        IMAGE_TAG  = "${env.BUILD_NUMBER}"
+    }
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '10'))
     }
 
     stages {
-        stage('Build') {
+        stage('Checkout') {
             steps {
-                script {
-                    // בניית האימג' ישירות - בלי סקריפטים מסורבלים
-                    sh "docker build -t ${IMAGE_NAME} ."
+                checkout scm
+            }
+        }
+
+        stage('Build Image') {
+            steps {
+                withCredentials([string(credentialsId: 'ecr-account-id', variable: 'AWS_ACCOUNT_ID')]) {
+                    script {
+                        env.ECR_URI = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}"
+                        docker.build("${ECR_URI}:${IMAGE_TAG}", ".")
+                    }
                 }
             }
         }
 
         stage('Test') {
             steps {
-                sh "docker run --rm ${IMAGE_NAME} python -m pytest --junitxml=results.xml"
+                sh "docker run --rm ${ECR_URI}:${IMAGE_TAG} sh -c 'npm test'"
             }
-            post { always { junit 'results.xml' } }
-        }
-
-        stage('Push to ECR') {
-            when { expression { return params.PUSH_TO_ECR ?: true } }
-            steps {
-                script {
-                    // שימוש ב-Docker pipeline plugin אם מותקן, או פקודות פשוטות
-                    sh "aws ecr get-login-password | docker login --username AWS --password-stdin ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
-                    sh "docker tag ${IMAGE_NAME} ${ECR_URI}:${IMAGE_NAME}"
-                    sh "docker push ${ECR_URI}:${IMAGE_NAME}"
+            post {
+                always {
+                    junit allowEmptyResults: true, testResults: '**/test-results/*.xml'
                 }
             }
         }
 
-        stage('Deploy') {
-            when { branch 'master' }
+        stage('Push to ECR') {
             steps {
-                sshagent(['application-ec2-ssh']) {
-                    sh """
-                        ssh ${APP_USER}@${APP_HOST} "mkdir -p ${DEPLOY_DIR}"
-                        scp docker-compose.yml ${APP_USER}@${APP_HOST}:${DEPLOY_DIR}/
-                        ssh ${APP_USER}@${APP_HOST} "cd ${DEPLOY_DIR} && docker compose pull && docker compose up -d"
-                    """
+                withCredentials([
+                    string(credentialsId: 'aws-access-key-id', variable: 'AWS_ACCESS_KEY_ID'),
+                    string(credentialsId: 'aws-secret-access-key', variable: 'AWS_SECRET_ACCESS_KEY'),
+                    string(credentialsId: 'ecr-account-id', variable: 'AWS_ACCOUNT_ID')
+                ]) {
+                    sh '''
+                        set +x
+                        aws ecr get-login-password --region "$AWS_REGION" | \
+                        docker login --username AWS --password-stdin "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"
+                    '''
+                    script {
+                        docker.image("${ECR_URI}:${IMAGE_TAG}").push()
+                        docker.image("${ECR_URI}:${IMAGE_TAG}").push('latest')
+                    }
+                }
+            }
+        }
+
+        stage('Deploy to Production EC2') {
+            steps {
+                withCredentials([
+                    string(credentialsId: 'ecr-account-id', variable: 'AWS_ACCOUNT_ID'),
+                    string(credentialsId: 'ec2-host', variable: 'EC2_HOST'),
+                    sshUserPrivateKey(credentialsId: 'ec2-ssh-key', keyFileVariable: 'SSH_KEY_FILE', usernameVariable: 'SSH_USER')
+                ]) {
+                    sh '''
+                        set +x
+                        ssh -i "$SSH_KEY_FILE" -o StrictHostKeyChecking=no "${SSH_USER}@${EC2_HOST}" "
+                            aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com &&
+                            docker pull ${ECR_URI}:${IMAGE_TAG} &&
+                            docker stop my-app || true &&
+                            docker rm my-app || true &&
+                            docker run -d --name my-app -p 80:8080 --restart unless-stopped ${ECR_URI}:${IMAGE_TAG} &&
+                            docker image prune -f
+                        "
+                    '''
+                }
+            }
+        }
+
+        stage('Health Verification') {
+            steps {
+                withCredentials([string(credentialsId: 'ec2-host', variable: 'EC2_HOST')]) {
+                    script {
+                        def maxRetries = 10
+                        def retryInterval = 6
+                        def healthy = false
+
+                        for (int i = 0; i < maxRetries; i++) {
+                            def status = sh(
+                                script: 'curl -s -o /dev/null -w "%{http_code}" http://$EC2_HOST/health || true',
+                                returnStdout: true
+                            ).trim()
+
+                            if (status == '200') {
+                                healthy = true
+                                echo "Health check passed (attempt ${i + 1})"
+                                break
+                            } else {
+                                echo "Health check attempt ${i + 1} failed (status: ${status}), retrying in ${retryInterval}s..."
+                                sleep retryInterval
+                            }
+                        }
+
+                        if (!healthy) {
+                            error("Health check failed after ${maxRetries} attempts.")
+                        }
+                    }
                 }
             }
         }
     }
-    
-    post { always { cleanWs() } } // ניקוי אוטומטי של סביבת העבודה
+
+    post {
+        success {
+            echo "Deployed build ${IMAGE_TAG} to production successfully."
+        }
+        failure {
+            echo "Pipeline failed. Consider rollback."
+        }
+        always {
+            sh "docker image prune -f || true"
+        }
+    }
 }
