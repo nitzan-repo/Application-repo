@@ -1,84 +1,57 @@
 pipeline {
-    agent { docker { image 'python:3.9-slim' } }
-    
+    agent { docker { image 'docker:27-cli'; args '-u 0:0 -v /var/run/docker.sock:/var/run/docker.sock' } }
+
     environment {
-        AWS_REGION = 'us-east-1'
-        ECR_REPO = '992382545251.dkr.ecr.us-east-1.amazonaws.com/ecr-repo-nitzan'
-        IMAGE_TAG = "pr-${env.CHANGE_ID ?: 'main'}-${env.BUILD_NUMBER}"
-        PROD_SERVER = 'ubuntu@44.195.88.151'
+        // הגדרות קבועות
+        APP_USER = 'ec2-user'
+        DEPLOY_DIR = '/opt/calculator-app'
+        IMAGE_NAME = "calculator-app:${env.BRANCH_NAME}-${env.BUILD_NUMBER}"
+        // חישוב דינמי פשוט
+        IS_MASTER = "${env.BRANCH_NAME == 'master'}"
     }
-    
+
     stages {
-        stage('Checkout') {
-            steps { checkout scm }
-        }
-        
         stage('Build') {
             steps {
-                sh "docker build -t ${ECR_REPO}:${IMAGE_TAG} ."
+                script {
+                    // בניית האימג' ישירות - בלי סקריפטים מסורבלים
+                    sh "docker build -t ${IMAGE_NAME} ."
+                }
             }
         }
-        
+
         stage('Test') {
             steps {
-                sh 'pip install pytest'
-                sh 'pytest --junitxml=results.xml'
+                sh "docker run --rm ${IMAGE_NAME} python -m pytest --junitxml=results.xml"
             }
-            post {
-                always { junit 'results.xml' }
-            }
+            post { always { junit 'results.xml' } }
         }
-        
+
         stage('Push to ECR') {
+            when { expression { return params.PUSH_TO_ECR ?: true } }
             steps {
                 script {
-                    withCredentials([[
-                        $class: 'AmazonWebServicesCredentialsBinding', 
-                        credentialsId: '992382545251'
-                    ]]) {
-                        sh "aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ECR_REPO}"
-                        sh "docker push ${ECR_REPO}:${IMAGE_TAG}"
-                    }
+                    // שימוש ב-Docker pipeline plugin אם מותקן, או פקודות פשוטות
+                    sh "aws ecr get-login-password | docker login --username AWS --password-stdin ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+                    sh "docker tag ${IMAGE_NAME} ${ECR_URI}:${IMAGE_NAME}"
+                    sh "docker push ${ECR_URI}:${IMAGE_NAME}"
                 }
             }
         }
-        
-        stage('Deploy to Production') {
-            when { branch 'main' }
+
+        stage('Deploy') {
+            when { branch 'master' }
             steps {
-                script {
-                    sshagent(['prod-ssh-key']) {
-                        sh """
-                            ssh -o StrictHostKeyChecking=no ${PROD_SERVER} "
-                                aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ECR_REPO}
-                                docker pull ${ECR_REPO}:${IMAGE_TAG}
-                                docker stop my-calculator-app || true
-                                docker rm my-calculator-app || true
-                                docker run -d --name my-calculator-app -p 80:80 ${ECR_REPO}:${IMAGE_TAG}
-                            "
-                        """
-                    }
-                }
-            }
-        }
-        
-        stage('Health Verification') {
-            when { branch 'main' }
-            steps {
-                script {
+                sshagent(['application-ec2-ssh']) {
                     sh """
-                        for i in {1..5}; do
-                            sleep 5
-                            if curl -f http://44.195.88.151/health; then
-                                echo 'Health check passed!'
-                                exit 0
-                            fi
-                            echo 'Health check failed, retrying...'
-                        done
-                        exit 1
+                        ssh ${APP_USER}@${APP_HOST} "mkdir -p ${DEPLOY_DIR}"
+                        scp docker-compose.yml ${APP_USER}@${APP_HOST}:${DEPLOY_DIR}/
+                        ssh ${APP_USER}@${APP_HOST} "cd ${DEPLOY_DIR} && docker compose pull && docker compose up -d"
                     """
                 }
             }
         }
     }
+    
+    post { always { cleanWs() } } // ניקוי אוטומטי של סביבת העבודה
 }
