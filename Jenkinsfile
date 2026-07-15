@@ -33,7 +33,7 @@ pipeline {
 
         stage('Test') {
             steps {
-                sh "docker run --rm ${ECR_URI}:${IMAGE_TAG} sh -c 'npm test'"
+                sh "docker run --rm ${ECR_URI}:${IMAGE_TAG} sh -c 'pytest --junitxml=test-results/results.xml'"
             }
             post {
                 always {
